@@ -9,7 +9,7 @@ let
   cfg = config.zenos.maintenance;
 
   # Directory to store the timestamp
-  stateDir = "/var/lib/zenos";
+  stateDir = "/System/ZenOS/Maintenance";
   timestampFile = "${stateDir}/last_maintenance";
 
   # The Maintenance Script (Root)
@@ -61,7 +61,7 @@ let
     if [ $DIFF -gt $SEVEN_DAYS ]; then
       ${pkgs.libnotify}/bin/notify-send \
         "ZenOS cleanup" \
-        "Maintenance overdue (>7 days). Please leave the device ON and PLUGGED IN tonight to allow automatic updates and optimization." \
+        "Maintenance overdue (>7 days). Please leave the device ON and PLUGGED IN tonight (but it can be at any other time when your device is idle) to allow automatic security updates and optimization." \
         -i zenos-symbolic \
         -u critical \
         --expire-time=0 \
