@@ -8,41 +8,61 @@
 let
   cfg = config.zenos.maintenance;
 
-  # Directory to store the timestamps
+  # Directory paths
   stateDir = "/System/ZenOS/Maintenance";
   timestampFile = "${stateDir}/last_maintenance";
   nagTimestampFile = "${stateDir}/last_nag";
+  firstRunFile = "${stateDir}/first_run_seen";
 
-  # --- Helper: Send Notification from Root ---
-  # Tries to find the active user on seat0 and send a notification
+  # --- Helper: Send Notification from Root to Active User ---
+  # UPDATED: Full paths for all binaries to prevent "command not found" in activation scripts
   notifyScript = pkgs.writeShellScript "zenos-notify-helper" ''
     SUMMARY=$1
     BODY=$2
 
-    # Find primary session on seat0
-    SESSION=$(loginctl list-sessions | grep seat0 | awk '{print $1}' | head -n1)
-    if [ -n "$SESSION" ]; then
-      USER_ID=$(loginctl show-session -p User --value "$SESSION")
-      USER_NAME=$(id -un "$USER_ID")
+    # Tools
+    LOGINCTL="${pkgs.systemd}/bin/loginctl"
+    GREP="${pkgs.gnugrep}/bin/grep"
+    AWK="${pkgs.gawk}/bin/awk"
+    HEAD="${pkgs.coreutils}/bin/head"
+    ID="${pkgs.coreutils}/bin/id"
+    SUDO="${pkgs.sudo}/bin/sudo"
+    NOTIFY="${pkgs.libnotify}/bin/notify-send"
+
+    # 1. Find the primary user session on seat0
+    SESSION_ID=$($LOGINCTL list-sessions | $GREP seat0 | $AWK '{print $1}' | $HEAD -n1)
+
+    if [ -n "$SESSION_ID" ]; then
+      USER_ID=$($LOGINCTL show-session -p User --value "$SESSION_ID")
+      USER_NAME=$($ID -un "$USER_ID")
+      
+      # 2. Critical Environment Variables for GUI interaction
       USER_DBUS="/run/user/$USER_ID/bus"
+      USER_RUNTIME="/run/user/$USER_ID"
       
       if [ -S "$USER_DBUS" ]; then
-        # Switch to user and send notification
-        ${pkgs.sudo}/bin/sudo -u "$USER_NAME" \
+        # 3. Execute notify-send as the user with full context
+        $SUDO -u "$USER_NAME" \
           DISPLAY=:0 \
           DBUS_SESSION_BUS_ADDRESS="unix:path=$USER_DBUS" \
-          ${pkgs.libnotify}/bin/notify-send "$SUMMARY" "$BODY" \
+          XDG_RUNTIME_DIR="$USER_RUNTIME" \
+          $NOTIFY "$SUMMARY" "$BODY" \
           -i zenos-symbolic \
+          -u critical \
           -a "ZenOS Maintenance"
+        
+        # Return exit code of notify-send
+        exit $?
       fi
     fi
+    exit 1
   '';
 
   # --- 1. The Core Logic (Daily Run) ---
   maintenanceCore = pkgs.writeShellScript "zenos-maintenance-core" ''
     set -e
 
-    # 1. Frequency Check
+    # Frequency Check (Once every 24h)
     if [ -f "${timestampFile}" ]; then
       LAST_RUN=$(stat -c %Y "${timestampFile}")
       NOW=$(date +%s)
@@ -53,12 +73,10 @@ let
       fi
     fi
 
-    # Notify User: Starting
     ${notifyScript} "System Maintenance" "Starting daily update & cleanup..."
-
     echo "Starting ZenOS Maintenance..."
 
-    # 2. Update System
+    # Update System
     if [ -n "${cfg.flakePath}" ] && [ -f "${cfg.flakePath}/flake.nix" ]; then
       ${pkgs.nix}/bin/nix flake update --flake "${cfg.flakePath}"
       ${pkgs.nixos-rebuild}/bin/nixos-rebuild switch --flake "${cfg.flakePath}"
@@ -67,29 +85,27 @@ let
       ${pkgs.nixos-rebuild}/bin/nixos-rebuild switch --upgrade
     fi
 
-    # 3. Cleanup
+    # Cleanup
     ${pkgs.nix}/bin/nix-collect-garbage --delete-older-than 7d
     ${pkgs.nix}/bin/nix-store --optimise
 
-    # 4. Timestamp
+    # Timestamp
     mkdir -p ${stateDir}
     touch ${timestampFile}
     chmod 644 ${timestampFile}
 
-    # Notify User: Done
     ${notifyScript} "System Maintenance" "Daily maintenance complete."
     echo "ZenOS Maintenance Complete."
   '';
 
-  # --- 2. Shutdown Cleanup Script (Safe Mode) ---
-  # NO updates, NO network reliance. Just disk cleanup.
+  # --- 2. Shutdown Cleanup Script (Safe) ---
   shutdownCleanupScript = pkgs.writeShellScript "zenos-shutdown-cleanup" ''
     echo "Running safe shutdown cleanup..."
     ${pkgs.nix}/bin/nix-collect-garbage --delete-older-than 7d
     ${pkgs.nix}/bin/nix-store --optimise
   '';
 
-  # --- 3. Wrapper & Idle Checker (Same as before) ---
+  # --- 3. Wrappers & Checkers ---
   maintenanceWrapper = pkgs.writeShellScript "zenos-maintenance-wrapper" ''
     ${pkgs.systemd}/bin/systemd-inhibit \
       --what="sleep:shutdown:idle" \
@@ -116,10 +132,7 @@ let
     UPTIME_SEC=$(cat /proc/uptime | awk '{print $1}')
     NOW_MONO=$(echo "$UPTIME_SEC * 1000000" | ${pkgs.bc}/bin/bc | cut -d. -f1)
 
-    IDLE_DURATION=$((NOW_MONO - IDLE_SINCE))
-    ONE_HOUR=$((3600 * 1000000))
-
-    if [ "$IDLE_DURATION" -gt "$ONE_HOUR" ]; then
+    if [ $((NOW_MONO - IDLE_SINCE)) -gt $((3600 * 1000000)) ]; then
       ${pkgs.systemd}/bin/systemctl start zenos-maintenance.service
     fi
   '';
@@ -128,24 +141,37 @@ let
   nagScript = pkgs.writeShellScript "zenos-maintenance-nag" ''
     mkdir -p ${stateDir}
 
-    # -- A. Fresh Install Check --
+    # -- A. Fresh Install / Intro Check --
     if [ ! -f "${timestampFile}" ]; then
-      # Never run before! Notify immediately.
-      ${pkgs.libnotify}/bin/notify-send \
-        "ZenOS Setup" \
-        "First-time setup: Please leave your device idle/plugged in for ~1 hour tonight to allows initial updates." \
-        -i zenos-symbolic -u critical -a "ZenOS System"
-      exit 0
+      
+      # If we haven't shown the "First Time" message yet...
+      if [ ! -f "${firstRunFile}" ]; then
+        ${pkgs.libnotify}/bin/notify-send \
+          "ZenOS Maintenance" \
+          "Automatic maintenance is active. It will run daily when the device is idle." \
+          -i zenos-symbolic -u critical -a "ZenOS System"
+          
+        # Mark as seen so we don't spam this message on service restart
+        touch "${firstRunFile}"
+        
+        # Touch nag timestamp to start the 7-day grace period
+        touch "${nagTimestampFile}"
+        
+        exit 0
+      fi
+      
+      LAST_RUN=0
+    else
+      LAST_RUN=$(stat -c %Y "${timestampFile}")
     fi
 
     # -- B. Regular Overdue Check --
-    LAST_RUN=$(stat -c %Y "${timestampFile}")
     NOW=$(date +%s)
 
-    # 7 Days grace period
+    # Check if 7 days overdue
     if [ $((NOW - LAST_RUN)) -le 604800 ]; then exit 0; fi
 
-    # Check Nag Frequency (Weekly)
+    # Check Nag Frequency (Weekly Limit)
     if [ -f "${nagTimestampFile}" ]; then
       LAST_NAG=$(stat -c %Y "${nagTimestampFile}")
       if [ $((NOW - LAST_NAG)) -lt 604800 ]; then exit 0; fi
@@ -163,31 +189,41 @@ in
 {
   options.zenos.maintenance = {
     enable = lib.mkEnableOption "ZenOS Automatic Maintenance";
-
     nag = {
       enable = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Enable desktop notifications for overdue maintenance.";
       };
     };
-
     dates = lib.mkOption {
       type = lib.types.str;
       default = "03:00";
-      description = "Systemd calendar expression for scheduled maintenance.";
     };
-
     flakePath = lib.mkOption {
       type = lib.types.str;
       default = "/etc/nixos";
-      description = "Path to the system flake.nix.";
     };
   };
 
   config = lib.mkIf cfg.enable {
 
-    # --- Service A: Main Update Worker ---
+    # --- Feature: Activation Check (Rebuild Trigger) ---
+    system.activationScripts.zenosFirstRunCheck = ''
+      # Only trigger if we haven't seen the first run file yet
+      if [ ! -f "${firstRunFile}" ] && [ "${toString cfg.nag.enable}" = "1" ]; then
+        # UPDATED: Use && operator. Only create files if notification SUCCEEDS.
+        # This prevents marking as "seen" if the notification fails silently.
+        if ${notifyScript} "ZenOS Maintenance" "Automatic maintenance is active. It will run daily when the device is idle."; then
+            mkdir -p ${stateDir}
+            touch "${firstRunFile}"
+            touch "${nagTimestampFile}"
+        else
+            echo "ZenOS Maintenance: Notification failed. Will retry on next login."
+        fi
+      fi
+    '';
+
+    # --- Services ---
     systemd.services.zenos-maintenance = {
       description = "ZenOS System Update";
       serviceConfig = {
@@ -206,7 +242,6 @@ in
       };
     };
 
-    # --- Service B: Sleep Trap ---
     systemd.services.zenos-maintenance-on-sleep = {
       description = "ZenOS Update (Sleep Hook)";
       before = [
@@ -228,16 +263,13 @@ in
       };
     };
 
-    # --- Service C: Shutdown Cleanup (Safe) ---
     systemd.services.zenos-shutdown-cleanup = {
       description = "ZenOS Shutdown Garbage Collection";
-      # Run on PowerOff, Reboot, or Halt
       wantedBy = [
         "poweroff.target"
         "reboot.target"
         "halt.target"
       ];
-      # Must run before the actual shutdown logic
       before = [
         "poweroff.target"
         "reboot.target"
@@ -247,11 +279,10 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = shutdownCleanupScript;
-        TimeoutSec = "120"; # Give it 2 mins max
+        TimeoutSec = "120";
       };
     };
 
-    # --- Service D: Idle Check ---
     systemd.services.zenos-maintenance-idle-check = {
       description = "Idle Check Trigger";
       serviceConfig = {
@@ -276,11 +307,8 @@ in
 
     systemd.tmpfiles.rules = [
       "d ${stateDir} 0775 root users -"
-      "f ${timestampFile} 0644 root root -"
-      "f ${nagTimestampFile} 0664 root users -"
     ];
 
-    # --- Service E: User Nag ---
     systemd.user.services.zenos-maintenance-nag = lib.mkIf cfg.nag.enable {
       description = "Check ZenOS Maintenance Status";
       script = "${nagScript}";
@@ -295,7 +323,6 @@ in
     systemd.user.timers.zenos-maintenance-nag = lib.mkIf cfg.nag.enable {
       wantedBy = [ "timers.target" ];
       timerConfig = {
-        # Run 10 seconds after login to catch fresh installs immediately
         OnStartupSec = "10s";
         OnUnitActiveSec = "6h";
       };
