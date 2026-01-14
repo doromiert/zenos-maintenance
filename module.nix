@@ -129,9 +129,11 @@ let
   '';
 
   # --- 3. Wrappers & Checkers ---
+  # FIX: Changed --what from "sleep:shutdown:idle" to "shutdown:idle"
+  # This inhibits auto-sleep (idle) and shutdown, but allows manual sleep (lid close)
   maintenanceWrapper = pkgs.writeShellScript "zenos-maintenance-wrapper" ''
     ${pkgs.systemd}/bin/systemd-inhibit \
-      --what="sleep:shutdown:idle" \
+      --what="shutdown:idle" \
       --who="ZenOS Maintenance" \
       --why="Performing daily system updates" \
       --mode="block" \
@@ -258,26 +260,9 @@ in
       };
     };
 
-    systemd.services.zenos-maintenance-on-sleep = {
-      description = "ZenOS Update (Sleep Hook)";
-      before = [
-        "sleep.target"
-        "suspend.target"
-        "hibernate.target"
-        "hybrid-sleep.target"
-      ];
-      wantedBy = [
-        "sleep.target"
-        "suspend.target"
-        "hibernate.target"
-        "hybrid-sleep.target"
-      ];
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = maintenanceCore;
-        TimeoutSec = "1200"; # Increased timeout for TRIM operations
-      };
-    };
+    # FIX: Removed systemd.services.zenos-maintenance-on-sleep
+    # This service was forcing the update to run every time you tried to sleep (lid close).
+    # We now rely exclusively on the Timer (03:00) and the Idle Checker.
 
     systemd.services.zenos-shutdown-cleanup = {
       description = "ZenOS Shutdown Garbage Collection";
