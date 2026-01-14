@@ -73,12 +73,39 @@ let
     ${notifyScript} "System Maintenance" "Starting optimization & cleanup..."
     echo "Starting ZenOS Maintenance..."
 
-    # -- 1. Update System --
-    if [ -n "${cfg.flakePath}" ] && [ -f "${cfg.flakePath}/flake.nix" ]; then
+    # -- 1. Update System (Staged Build Strategy) --
+    if [ -n "${cfg.flakePath}" ] && [ -d "${cfg.flakePath}" ]; then
+      FLAKE_PATH="${cfg.flakePath}"
+      
+      # Detect owner of the flake to avoid root-owned lockfiles
+      FLAKE_OWNER=$(stat -c '%U' "$FLAKE_PATH")
+      echo "Flake detected at $FLAKE_PATH (Owner: $FLAKE_OWNER)"
+
+      # A. Update flake.lock as the user (Preserves ownership in your home dir)
       echo "Updating Flake inputs..."
-      ${pkgs.nix}/bin/nix flake update --flake "${cfg.flakePath}"
-      ${pkgs.nixos-rebuild}/bin/nixos-rebuild switch --flake "${cfg.flakePath}"
+      ${pkgs.sudo}/bin/sudo -u "$FLAKE_OWNER" ${pkgs.nix}/bin/nix flake update --flake "$FLAKE_PATH"
+
+      # B. Create a temporary build area (Bypasses Daemon permission issues on /home)
+      BUILD_DIR=$(mktemp -d -t zenos-maint-XXXXXX)
+      echo "Staging build in $BUILD_DIR..."
+
+      # Copy flake content to temp
+      cp -r "$FLAKE_PATH/." "$BUILD_DIR/"
+      
+      # Fix permissions so Nix Daemon (nixbld) can read it
+      # 1. Root owns the temp files
+      chown -R root:root "$BUILD_DIR"
+      # 2. Everyone (including nixbld) can read/traverse
+      chmod -R u+rwX,go+rX "$BUILD_DIR"
+
+      # C. Build & Switch from the staged copy
+      echo "Rebuilding system from stage..."
+      ${pkgs.nixos-rebuild}/bin/nixos-rebuild switch --flake "$BUILD_DIR"
+
+      # Cleanup
+      rm -rf "$BUILD_DIR"
     else
+      # Fallback for channels
       ${pkgs.nix}/bin/nix-channel --update
       ${pkgs.nixos-rebuild}/bin/nixos-rebuild switch --upgrade
     fi
@@ -249,6 +276,7 @@ in
         CPUSchedulingPolicy = "idle";
         IOSchedulingClass = "idle"; # Low IO priority
       };
+      path = [ pkgs.git ]; # Ensure git is available for rebuilds
     };
 
     systemd.timers.zenos-maintenance = {
@@ -259,10 +287,6 @@ in
         Unit = "zenos-maintenance.service";
       };
     };
-
-    # FIX: Removed systemd.services.zenos-maintenance-on-sleep
-    # This service was forcing the update to run every time you tried to sleep (lid close).
-    # We now rely exclusively on the Timer (03:00) and the Idle Checker.
 
     systemd.services.zenos-shutdown-cleanup = {
       description = "ZenOS Shutdown Garbage Collection";
